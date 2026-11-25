@@ -3,12 +3,14 @@ import hashlib
 import logging
 import os
 import re
+import socket
 import subprocess
 import threading
 import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import httpx
 from PIL import Image
@@ -35,6 +37,7 @@ GEN_WIDTH = 640
 GEN_HEIGHT = 360
 
 _FASTSD_START_LOCK = threading.Lock()
+_FASTSD_GEN_LOCK = threading.Lock()
 _FASTSD_PROC: Optional[subprocess.Popen] = None
 
 
@@ -100,7 +103,21 @@ def build_local_sd_prompt(compact_scene_prompt: str) -> str:
     )
 
 
-def _is_fastsd_reachable(fastsd_url: str, timeout: float = 2.5) -> bool:
+def _is_tcp_port_open(fastsd_url: str, timeout: float = 0.8) -> bool:
+    """Return True if the FastSD host:port TCP socket is accepting connections (even if busy rendering)."""
+    try:
+        parsed = urlparse(fastsd_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _is_fastsd_http_ready(fastsd_url: str, timeout: float = 2.5) -> bool:
+    if not _is_tcp_port_open(fastsd_url, timeout=0.8):
+        return False
     for endpoint in ("/api/info", "/api/config", "/api/docs"):
         try:
             with httpx.Client(timeout=timeout) as client:
@@ -110,6 +127,14 @@ def _is_fastsd_reachable(fastsd_url: str, timeout: float = 2.5) -> bool:
         except Exception:
             continue
     return False
+
+
+def _is_fastsd_reachable(fastsd_url: str, timeout: float = 2.5) -> bool:
+    if _is_fastsd_http_ready(fastsd_url, timeout=timeout):
+        return True
+    # FastSD CPU handles /api/generate synchronously on one Uvicorn worker; if the TCP
+    # port is open, FastSD CPU is alive (busy generating) and must not be re-launched.
+    return _is_tcp_port_open(fastsd_url, timeout=0.8)
 
 
 def ensure_fastsd_running(
@@ -251,11 +276,14 @@ def check_services(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     upscale_enabled = bool(cfg.get("upscale_enabled", UPSCALE_ENABLED))
 
     errors: List[str] = []
-    fastsd_ok = _is_fastsd_reachable(fastsd_url)
+    http_ok = _is_fastsd_http_ready(fastsd_url)
+    fastsd_ok = http_ok or _is_tcp_port_open(fastsd_url)
     auto_start_available = (FASTSD_DIR / "src" / "app.py").exists()
 
-    if fastsd_ok:
+    if http_ok:
         fastsd_msg = f"FastSD CPU reachable at {fastsd_url}"
+    elif fastsd_ok:
+        fastsd_msg = f"FastSD CPU is busy generating an image at {fastsd_url}"
     elif auto_start_available:
         fastsd_msg = (
             f"FastSD CPU is offline at {fastsd_url} (will auto-start from ./tools/fastsdcpu when generating)."
@@ -370,8 +398,9 @@ def generate_image(
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
-            with httpx.Client(timeout=1800.0) as client:
-                resp = client.post(f"{fastsd_url}/api/generate", json=payload)
+            with _FASTSD_GEN_LOCK:
+                with httpx.Client(timeout=1800.0) as client:
+                    resp = client.post(f"{fastsd_url}/api/generate", json=payload)
 
             if resp.status_code == 200:
                 data = resp.json()
